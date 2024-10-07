@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:LostObject/screens/object_detail_screen.dart';
+import 'package:intl/intl.dart'; // Import du package intl
 import '../models/found_object.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
@@ -11,7 +12,7 @@ class HomeScreen extends StatefulWidget {
   _HomeScreenState createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final ApiService apiService = ApiService();
   final LocalStorageService localStorageService = LocalStorageService();
   List<FoundObject> foundObjects = [];
@@ -21,6 +22,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String? selectedCategory;
   String? restitutionFilter;
   DateTime? selectedDate;
+  bool isDateSearchActive = false;
+  DateTime? searchDate;
   List<String> categories = [];
   List<String> gares = [];
   bool showConsulted = false;
@@ -32,12 +35,17 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _scrollController = ScrollController();
     _scrollController.addListener(() {
       if (_scrollController.position.pixels ==
               _scrollController.position.maxScrollExtent &&
           !isLoadingMore) {
-        _loadMoreObjects();
+        if (isDateSearchActive && searchDate != null) {
+          _loadMoreObjectsByDate(searchDate!);
+        } else {
+          _loadMoreObjects();
+        }
       }
     });
 
@@ -47,9 +55,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    localStorageService.saveLastConsultationDate();
+    WidgetsBinding.instance.removeObserver(this);
     _scrollController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      localStorageService.saveLastConsultationDate();
+    }
   }
 
   Future<void> _loadObjects() async {
@@ -59,7 +75,6 @@ class _HomeScreenState extends State<HomeScreen> {
       });
 
       List<FoundObject> initialObjects = await apiService.fetchFoundObjects();
-
       setState(() {
         foundObjects = initialObjects;
         isLoading = false;
@@ -75,7 +90,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _loadMoreObjects() async {
+  Future<void> _loadMoreObjects() async {
     if (!isLoadingMore) {
       setState(() {
         isLoadingMore = true;
@@ -102,10 +117,61 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _searchObjectsByDate(DateTime date) async {
+    try {
+      setState(() {
+        isLoading = true;
+        isDateSearchActive = true;
+      });
+
+      List<FoundObject> objectsByDate =
+          await apiService.fetchObjectsByDate(date);
+
+      setState(() {
+        foundObjects = objectsByDate;
+        searchDate = date;
+        isLoading = false;
+      });
+    } catch (e) {
+      print('Erreur lors de la recherche des objets par date: $e');
+      setState(() {
+        isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadMoreObjectsByDate(DateTime date) async {
+    if (!isLoadingMore) {
+      setState(() {
+        isLoadingMore = true;
+      });
+
+      try {
+        final previousScrollHeight = _scrollController.position.maxScrollExtent;
+        List<FoundObject> newObjects =
+            await apiService.fetchMoreObjectsByDate(date);
+
+        setState(() {
+          foundObjects.addAll(newObjects);
+          isLoadingMore = false;
+        });
+
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollController.jumpTo(previousScrollHeight);
+        });
+      } catch (e) {
+        print(
+            'Erreur lors du chargement de plus d\'objets pour la date sélectionnée: $e');
+        setState(() {
+          isLoadingMore = false;
+        });
+      }
+    }
+  }
+
   void _loadLastConsultation() async {
     try {
       DateTime? lastDate = await localStorageService.getLastConsultationDate();
-      print('Dernière consultation chargée : $lastDate');
       setState(() {
         lastConsultationDate = lastDate;
       });
@@ -144,8 +210,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (picked != null && picked != selectedDate) {
       setState(() {
-        selectedDate = picked;
+        searchDate = picked;
+        isDateSearchActive = true;
       });
+      await _searchObjectsByDate(picked);
     }
   }
 
@@ -155,25 +223,27 @@ class _HomeScreenState extends State<HomeScreen> {
           selectedStation == null || object.station == selectedStation;
       final matchesCategory =
           selectedCategory == null || object.category == selectedCategory;
-      final matchesDate =
-          selectedDate == null || object.date.isAfter(selectedDate!);
+      final matchesDate = searchDate == null ||
+          object.date
+              .toLocal()
+              .toIso8601String()
+              .startsWith(DateFormat('yyyy-MM-dd').format(searchDate!));
       final matchesRestitution = restitutionFilter == null ||
           restitutionFilter == 'all' ||
           (restitutionFilter == 'not_returned' &&
               object.restitutionDate == null) ||
           (restitutionFilter == 'returned' && object.restitutionDate != null);
 
-      final isAfterLastConsultation = lastConsultationDate == null ||
-          showConsulted ||
-          object.date.isAfter(lastConsultationDate!);
-
       return matchesStation &&
           matchesCategory &&
           matchesDate &&
-          matchesRestitution &&
-          isAfterLastConsultation;
-    }).toList()
-      ..sort((a, b) => b.date.compareTo(a.date));
+          matchesRestitution;
+    }).toList();
+  }
+
+  String formatLastConsultation(DateTime date) {
+    final DateFormat formatter = DateFormat('dd/MM/yyyy HH:mm');
+    return formatter.format(date);
   }
 
   @override
@@ -190,7 +260,8 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    final filteredObjects = filterObjects(foundObjects);
+    final filteredObjects =
+        isDateSearchActive ? foundObjects : filterObjects(foundObjects);
 
     return Scaffold(
       appBar: AppBar(
@@ -208,8 +279,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: DropdownButtonFormField<String>(
                     isExpanded: true,
                     decoration: const InputDecoration(
-                      labelText: 'Sélectionner une gare',
+                      labelText: 'Gare',
                       border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(vertical: 8, horizontal: 8),
                     ),
                     value: selectedStation,
                     onChanged: (newValue) {
@@ -233,8 +306,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: DropdownButtonFormField<String>(
                     isExpanded: true,
                     decoration: const InputDecoration(
-                      labelText: 'Sélectionner une catégorie',
+                      labelText: 'Catégorie',
                       border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(vertical: 8, horizontal: 8),
                     ),
                     value: selectedCategory,
                     onChanged: (newValue) {
@@ -265,6 +340,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     decoration: const InputDecoration(
                       labelText: 'Restitution',
                       border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(vertical: 8, horizontal: 8),
                     ),
                     value: restitutionFilter,
                     onChanged: (newValue) {
@@ -286,16 +363,15 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: TextFormField(
                     readOnly: true,
                     decoration: const InputDecoration(
-                      labelText: 'Sélectionner une date',
+                      labelText: 'Date',
                       border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(vertical: 8, horizontal: 8),
                     ),
                     onTap: () => _selectDate(context),
                     controller: TextEditingController(
-                      text: selectedDate != null
-                          ? selectedDate!
-                              .toLocal()
-                              .toIso8601String()
-                              .substring(0, 10)
+                      text: searchDate != null
+                          ? DateFormat('dd/MM/yyyy').format(searchDate!)
                           : '',
                     ),
                   ),
@@ -303,13 +379,14 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
             const SizedBox(height: 10),
-            // Switch pour afficher les objets consultés
+            // Switch avec la dernière consultation affichée
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 Expanded(
                   child: SwitchListTile(
-                    title: const Text('Afficher les derniers objets consultés'),
+                    title:
+                        const Text('Afficher les derniers objets consultés.'),
                     value: showConsulted,
                     onChanged: (value) {
                       setState(() {
@@ -320,6 +397,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ],
             ),
+            Text(lastConsultationDate != null
+                ? 'Dernière consultation : ${formatLastConsultation(lastConsultationDate!)}'
+                : 'Dernière consultation : aucune.'),
             const SizedBox(height: 10),
             // Bouton de réinitialisation des filtres
             Row(
@@ -332,17 +412,16 @@ class _HomeScreenState extends State<HomeScreen> {
                       selectedCategory = null;
                       restitutionFilter = null;
                       selectedDate = null;
+                      searchDate = null;
                       showConsulted = false;
+                      isDateSearchActive = false;
+                      _loadObjects();
                     });
                   },
                   child: const Text('Réinitialiser les filtres'),
                 ),
               ],
             ),
-            const SizedBox(height: 10),
-            Text(lastConsultationDate != null
-                ? 'Dernière consultation : ${lastConsultationDate!.toLocal().toIso8601String().substring(0, 10)}'
-                : 'Aucune consultation'),
             const SizedBox(height: 10),
             // Liste des objets trouvés filtrés
             Expanded(
@@ -364,7 +443,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: ListTile(
-                      title: Text(filteredObjects[index].category),
+                      title: Text(filteredObjects[index].description),
                       subtitle: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
